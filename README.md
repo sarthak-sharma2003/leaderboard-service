@@ -3,7 +3,7 @@
 A small player-stats and leaderboard backend: games submit scores over gRPC, and the service
 answers "who's on top", "where am I", and "how do I compare to my friends".
 
-Java 25 · Spring Boot 4 · gRPC / Protocol Buffers · PostgreSQL · Redis · Docker
+Java 25 · Spring Boot 4 · gRPC / Protocol Buffers · PostgreSQL · Redis · Docker · Azure Container Apps
 
 ```mermaid
 flowchart LR
@@ -24,7 +24,19 @@ Defined in [`leaderboard.proto`](src/main/proto/leaderboard.proto).
 | `GetAroundPlayer` | The player plus `radius` neighbours above and below |
 | `GetFriends` | Ranks only the player ids the caller passes in |
 
-## Run it
+## Live demo
+
+The service runs on Azure Container Apps in Canada Central. It scales to zero when idle, so the
+first call after a quiet spell takes about 20 seconds while a replica starts; after that, calls
+return in well under a second.
+
+```bash
+grpcurl -d '{"leaderboard_id":"demo","limit":10}' \
+  leaderboard.gentlesand-2647a396.canadacentral.azurecontainerapps.io:443 \
+  leaderboard.v1.Leaderboard/GetTop
+```
+
+## Run it locally
 
 ```bash
 docker compose up --build
@@ -117,6 +129,19 @@ runs in GitHub Actions on every push.
 
 To run the service locally without Compose: `./mvnw spring-boot:test-run`.
 
+## Deployment
+
+[`deploy.sh`](deploy.sh) deploys the image that CI publishes to Azure Container Apps.
+
+- **The service and Redis run as two containers in one replica.** Redis is a sidecar on
+  `localhost`, so it scales to zero with the app and comes back empty.
+- **Postgres is a managed database on Neon**, so scores outlive every replica.
+- **Every cold start exercises the rebuild path.** The first request after a scale-up finds Redis
+  empty and reloads the leaderboard from Postgres. From the production log after a restart:
+  `Rebuilt leaderboard demo from Postgres: 3 players in 200 ms`.
+- **Ingress is HTTP/2 end to end**, which gRPC needs, and Azure terminates TLS. This rules out
+  Azure's "express" environments, which support neither HTTP/2 ingress nor sidecars.
+
 ## Known limits
 
 - **Ties** are ordered by player id, not by who reached the score first.
@@ -127,4 +152,5 @@ To run the service locally without Compose: `./mvnw spring-boot:test-run`.
 - **If the Redis update fails after the Postgres commit**, that player's cached score is stale
   until they submit again or the leaderboard is rebuilt. The client gets an error and can retry
   safely.
-- No authentication, and a single Redis node.
+- No authentication, and a single Redis node. The hosted demo is open to anyone and capped at
+  one small replica.
