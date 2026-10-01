@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package leaderboard.v1;
+
+option java_multiple_files = true;
+option java_package = "dev.sarthak.leaderboard.v1";
+
+// Records player scores and serves ranked views of a leaderboard.
+service Leaderboard {
+  // Keeps each player's best score; a lower submission leaves it unchanged.
+  // Returns the player's best score and current global rank.
+  rpc SubmitScore(SubmitScoreRequest) returns (Entry);
+
+  // Highest scores first.
+  rpc GetTop(GetTopRequest) returns (Page);
+
+  // The player plus up to `radius` neighbours above and below ("around me").
+  rpc GetAroundPlayer(GetAroundPlayerRequest) returns (Page);
+
+  // Ranks only the given players, e.g. a friends list owned by a social service.
+  // Here `rank` is the position among those players, not the global rank.
+  rpc GetFriends(GetFriendsRequest) returns (Page);
+}
+
+message SubmitScoreRequest {
+  string leaderboard_id = 1;
+  string player_id = 2;
+  int64 score = 3;
+}
+
+message GetTopRequest {
+  string leaderboard_id = 1;
+  int32 limit = 2;
+}
+
+message GetAroundPlayerRequest {
+  string leaderboard_id = 1;
+  string player_id = 2;
+  int32 radius = 3;
+}
+
+message GetFriendsRequest {
+  string leaderboard_id = 1;
+  repeated string player_ids = 2;
+}
+
+message Entry {
+  string player_id = 1;
+  int64 score = 2;
+  int64 rank = 3; // 1-based
+}
+
+message Page {
+  repeated Entry entries = 1;
+  int64 total_players = 2;
+}
