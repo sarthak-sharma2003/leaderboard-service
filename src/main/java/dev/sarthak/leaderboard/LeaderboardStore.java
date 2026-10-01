@@ -5,8 +5,8 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import dev.sarthak.leaderboard.v1.Entry;
 import dev.sarthak.leaderboard.v1.Page;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.IntStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -59,10 +59,10 @@ class LeaderboardStore {
 				ON CONFLICT (leaderboard_id, player_id) DO UPDATE
 				SET score = GREATEST(scores.score, EXCLUDED.score), updated_at = now()
 				RETURNING score""").params(board, player, score).query(Long.class).single();
-		Long rank = redis.execute(ADD_IF_CACHED, List.of(key(board)), Long.toString(best), player);
-		if (rank == -1) {
-			rebuild(board); // picks up this write too: it is already committed
-			rank = redis.opsForZSet().reverseRank(key(board), player);
+		Long rank;
+		// A rebuild's snapshot can predate this write, so add it again once the leaderboard is cached.
+		while ((rank = redis.execute(ADD_IF_CACHED, List.of(key(board)), Long.toString(best), player)) == -1) {
+			rebuild(board);
 		}
 		return entry(player, best, rank + 1);
 	}
@@ -101,29 +101,39 @@ class LeaderboardStore {
 	}
 
 	private void warm(String board) {
-		if (!Boolean.TRUE.equals(redis.hasKey(key(board)))) {
+		if (!cached(board)) {
 			rebuild(board);
 		}
 	}
 
-	// ponytail: rebuilds inline on whichever request finds the leaderboard missing; boards with
-	// millions of players want a background job plus a lock so only one worker rebuilds.
-	private void rebuild(String board) {
+	private boolean cached(String board) {
+		return Boolean.TRUE.equals(redis.hasKey(key(board)));
+	}
+
+	// One rebuild at a time. Without the lock, every request that finds a cold cache reloads the
+	// whole leaderboard at once: 64 concurrent clients meant 64 full reloads from Postgres.
+	// ponytail: one lock per instance for all leaderboards, so N replicas may each rebuild once and
+	// cold boards rebuild one after another; use a per-board Redis lock (SET NX PX) if that hurts.
+	private synchronized void rebuild(String board) {
+		if (cached(board)) {
+			return; // another request rebuilt it while this one waited for the lock
+		}
 		long start = System.nanoTime();
-		byte[] key = key(board).getBytes(UTF_8);
-		List<Tuple> rows = db.sql("SELECT player_id, score FROM scores WHERE leaderboard_id = ?")
+		Set<Tuple> rows = db.sql("SELECT player_id, score FROM scores WHERE leaderboard_id = ?")
 			.param(board)
 			.query((rs, i) -> (Tuple) new DefaultTuple(rs.getString(1).getBytes(UTF_8), (double) rs.getLong(2)))
-			.list();
-		for (int i = 0; i < rows.size(); i += 1000) {
-			var batch = new HashSet<>(rows.subList(i, Math.min(i + 1000, rows.size())));
-			// GT so a concurrent, newer submit is never overwritten by this older snapshot.
-			redis.execute((RedisCallback<Long>) c -> c.zSetCommands().zAdd(key, batch, ZAddArgs.empty().gt()));
+			.set();
+		if (rows.isEmpty()) {
+			return;
 		}
-		if (!rows.isEmpty()) {
-			log.info("Rebuilt leaderboard {} from Postgres: {} players in {} ms", board, rows.size(),
-					(System.nanoTime() - start) / 1_000_000);
-		}
+		// A single ZADD is atomic, so readers never see a half-loaded leaderboard. GT so a newer
+		// score written by another instance is never overwritten by this older snapshot.
+		// ponytail: Redis caps one command at about 1M arguments, so this tops out near 500k
+		// players; beyond that, load a temporary key in chunks and RENAME it into place.
+		redis.execute((RedisCallback<Long>) c -> c.zSetCommands()
+			.zAdd(key(board).getBytes(UTF_8), rows, ZAddArgs.empty().gt()));
+		log.info("Rebuilt leaderboard {} from Postgres: {} players in {} ms", board, rows.size(),
+				(System.nanoTime() - start) / 1_000_000);
 	}
 
 	private long size(String board) {

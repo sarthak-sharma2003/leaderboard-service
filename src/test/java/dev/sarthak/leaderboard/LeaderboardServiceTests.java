@@ -16,19 +16,27 @@ import io.grpc.ManagedChannel;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.grpc.test.autoconfigure.LocalGrpcServerPort;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.context.annotation.Import;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.util.StringUtils;
 
 /** End to end over a real gRPC port, against real Postgres and Redis containers. */
 @Import(TestcontainersConfiguration.class)
 @SpringBootTest(properties = "spring.grpc.server.port=0")
+@ExtendWith(OutputCaptureExtension.class)
 class LeaderboardServiceTests {
 
 	@LocalGrpcServerPort
@@ -36,6 +44,9 @@ class LeaderboardServiceTests {
 
 	@Autowired
 	StringRedisTemplate redis;
+
+	@Autowired
+	JdbcClient db;
 
 	ManagedChannel channel;
 
@@ -94,6 +105,21 @@ class LeaderboardServiceTests {
 		// The first write after the loss must not leave a leaderboard holding only "cat".
 		assertThat(submit("b3", "cat", 150).getRank()).isEqualTo(2);
 		assertThat(top("b3", 10).getTotalPlayers()).isEqualTo(3);
+	}
+
+	@Test
+	void coldLeaderboardIsRebuiltOnceUnderConcurrentRequests(CapturedOutput output) throws Exception {
+		// Straight into Postgres, so Redis has never seen this leaderboard.
+		db.sql("INSERT INTO scores (leaderboard_id, player_id, score) SELECT 'b5', 'p' || g, g FROM generate_series(1, 20000) g")
+			.update();
+
+		try (var pool = Executors.newFixedThreadPool(16)) {
+			var calls = IntStream.range(0, 16).mapToObj(i -> pool.submit(() -> top("b5", 10))).toList();
+			for (var call : calls) {
+				assertThat(call.get().getTotalPlayers()).isEqualTo(20000); // never a half-loaded leaderboard
+			}
+		}
+		assertThat(StringUtils.countOccurrencesOf(output.getOut(), "Rebuilt leaderboard b5")).isEqualTo(1);
 	}
 
 	@Test
